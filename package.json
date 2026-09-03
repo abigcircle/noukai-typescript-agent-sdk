@@ -1,0 +1,58 @@
+{
+  "name": "@noukai/agent",
+  "version": "0.1.0",
+  "description": "Generic client-side agent framework for Noukai flows — a domain-agnostic yield/resume tool-calling loop (with an optional React hook) for browser and relay agents.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "engines": { "node": ">=18.0.0" },
+  "sideEffects": false,
+  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
+  "license": "MIT",
+  "homepage": "https://noukai.dev",
+  "repository": { "type": "git", "url": "git+https://github.com/abigcircle/noukai-typescript-agent-sdk.git" },
+  "bugs": { "url": "https://github.com/abigcircle/noukai-typescript-agent-sdk/issues" },
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "prepublishOnly": "pnpm build && pnpm check-types && pnpm test"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true }
+  },
+  "devDependencies": {
+    "@eslint/js": "^9",
+    "@types/react": "^18.2.20",
+    "@typescript-eslint/eslint-plugin": "^8",
+    "@typescript-eslint/parser": "^8",
+    "eslint": "^9",
+    "eslint-config-prettier": "^10",
+    "prettier": "^3",
+    "tsup": "^8",
+    "typescript": "^5.5",
+    "typescript-eslint": "^8",
+    "vitest": "^3"
+  }
+}
