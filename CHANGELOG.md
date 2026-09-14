@@ -10,6 +10,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-14
+
+### Added
+
+- **Background (detached) turns for `useAgentChat` (opt-in; design
+  `20260914-SDK-agent-background-turns`).** A turn started for a session can now
+  keep running to completion even after the active `sessionId` moves away — so a
+  consumer multiplexing many chat tabs through one `useAgentChat` instance
+  (swapping `sessionId` to the active tab) no longer loses an in-flight turn on a
+  tab switch. Enable with `useAgentChat({ sessionId, store, backgroundTurns: true })`
+  (requires both `sessionId` and `store`). When you return to the session, its
+  live/updated/completed state is shown from a still-attached live stream and/or
+  the store.
+  - **New module-level turn manager** (`src/turn-manager.ts`, React-free) owns a
+    turn's execution — its own `AbortController`, a live record, and the store
+    flush on completion — keyed by `(store identity, sessionId)`. Turns survive a
+    hook unmount/remount (they live in module scope); a page reload keeps only
+    what the store persisted, exactly as before. Browser + SSR safe: no top-level
+    Node built-ins, no import side effects.
+  - **`stop(sessionId?)`** — widened from `stop()`. With no argument it aborts the
+    ACTIVE session's turn (unchanged); pass a `sessionId` to abort a specific
+    backgrounded session's turn. **Switching sessions never aborts** in background
+    mode — aborting is explicit.
+  - **`backgroundSessions: readonly string[]`** on the hook return — sessionIds
+    (for this store) with an in-flight background turn, for showing a spinner on
+    backgrounded tabs.
+  - **`onTurnError?(error, { sessionId })`** option — a backgrounded turn that
+    fails surfaces the error on return (as an assistant error bubble, persisted)
+    and, if provided, fires this callback in real time even while another session
+    is active.
+  - **Callback session context.** `onMetadata` and `onToolCallStart` now receive
+    an optional `{ sessionId }` second argument, and `ToolResolver` an optional
+    `{ sessionId }` ctx — so a single multiplexed resolver/handler can route a
+    backgrounded turn's tool resolution and metadata to the RIGHT session's state
+    instead of "whatever tab is focused". **Backward compatible** — code that
+    ignores the extra argument is unaffected.
+  - **New exports:** `subscribeBackgroundSessions` / `useBackgroundSessions`
+    (observe live turns for a tab strip rendered outside the chat hook),
+    `abortAllTurns` (hard teardown, e.g. logout), and the `LiveTurn` /
+    `LiveTurnStatus` types. The turn manager itself stays internal.
+
+### Changed
+
+- **Drop-in / no behavior change with the flag off.** `backgroundTurns` defaults
+  `false`; every existing path (inline `sendMessage`, abort-on-sessionId-change,
+  abort-on-unmount, the save-gate) is byte-for-byte the prior behavior. The
+  existing test suite is unchanged and green. Enabling the flag without a `store`
+  is a no-op (a dev-mode warning is logged) and falls back to inline turns.
+- **Persistence in background mode is owned by the turn manager** (it saves the
+  finished `{ conversation, displayMessages }` once on completion). The hook's own
+  save effect is inert while a background turn runs, avoiding a double-write.
+- **No `@noukai/sdk` change required** — `createRelayFlow().execute({ signal })` is
+  already a fire-and-await, abort-aware promise; detachment is entirely about
+  where that promise is awaited and where its output lands, both inside
+  `@noukai/agent`.
+
 ## [0.2.0] — 2026-09-14
 
 ### Changed

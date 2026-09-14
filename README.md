@@ -136,12 +136,58 @@ and the resume shape is shared.
 On completion the loop unwraps both result shapes — Nana's `{ content }` and the
 chat block's `{ message }` — falling back to `JSON.stringify` for anything else.
 
+## Background turns (multi-tab)
+
+By default, changing `sessionId` (e.g. switching chat tabs on one `useAgentChat`
+instance) **aborts** the in-flight turn. Opt into **background turns** to let a
+turn keep running to completion after you switch away, and see its result when
+you return:
+
+```ts
+const chat = useAgentChat({
+  endpoint: "/api/nana/execute",
+  tools: registry.definitions(),
+  // ctx.sessionId lets one resolver route to the turn's OWN session's state
+  // instead of the focused tab (absent on the default, non-background path):
+  resolveToolCall: (call, ctx) => resolveForSession(ctx?.sessionId ?? activeTabId, call),
+  sessionId: activeTabId,      // swap this to switch tabs
+  store: myStore,              // required — where a detached turn persists
+  backgroundTurns: true,       // opt in (default false = abort-on-switch)
+  onMetadata: (meta, ctx) => applyOpsTo(ctx?.sessionId ?? activeTabId, meta),
+  onTurnError: (err, { sessionId }) => flagTab(sessionId, err),
+});
+
+// Show a spinner on backgrounded tabs:
+chat.backgroundSessions;       // sessionIds (for this store) with a live turn
+chat.stop();                   // abort the ACTIVE session's turn
+chat.stop("other-tab-id");     // abort a specific backgrounded turn
+```
+
+- **Requires `sessionId` + `store`.** The turn runs in a module-level manager
+  keyed by `(store, sessionId)`, so it survives a hook unmount/remount. A page
+  reload keeps only what the store persisted (unchanged). Enabling the flag
+  without a store is a no-op.
+- **Switching never aborts** — only `stop(sessionId?)` does. Persistence is
+  handled by the manager (it saves the finished exchange once on completion).
+- **Route by session.** For a consumer multiplexing many tabs, `onMetadata` /
+  `onToolCallStart` receive `{ sessionId }` and `resolveToolCall` an optional
+  `ctx.sessionId`, so a backgrounded turn's tool resolution and metadata reach the
+  right tab's state rather than the focused one. (All backward compatible — ignore
+  the extra argument and nothing changes.)
+- **Observe from elsewhere.** A tab strip rendered outside the chat hook can call
+  `useBackgroundSessions(store)` (React) or `subscribeBackgroundSessions(store, cb)`
+  (framework-free).
+
+Design notes: `docs/design-logs/2026/09Sep/20260914-SDK-agent-background-turns.md`.
+
 ## Surface
 
 | Export | Kind | Role |
 |--------|------|------|
 | `runAgentLoop(message, options)` | async fn | Pure yield/resume loop. Fresh POST + resume; no React. |
-| `useAgentChat(options)` | React hook | Display messages, `isLoading`, abort, multi-turn conversation. |
+| `useAgentChat(options)` | React hook | Display messages, `isLoading`, abort, multi-turn conversation, optional background turns. |
+| `useBackgroundSessions(store)` | React hook | sessionIds with a live background turn (for tab spinners outside the chat hook). |
+| `subscribeBackgroundSessions(store, cb)` | fn | Framework-free version of the above; returns an unsubscribe. |
 | `createToolRegistry()` | factory | Declarative tool register + resolve. |
 | `ToolLabelFormatter` | class | Progress labels for in-flight tool calls. |
 | wire adapters | fns | `toWireToolDef(s)`, `parseWireToolCall`, `toWireToolResult` — internal ↔ OpenAI tool wire format. |

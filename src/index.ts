@@ -44,6 +44,18 @@ export type { AgentLoopOptions, AgentLoopResult } from "./agent-loop.js";
 // ─── Hook (React) ─────────────────────────────────────────────
 export { useAgentChat } from "./use-agent-chat.js";
 
+// ─── Background (detached) turns ──────────────────────────────
+// Turns that keep running after the active sessionId moves away (opt-in via
+// `useAgentChat({ backgroundTurns: true })`). The hook is the primary surface;
+// these helpers are the minimal committed public seam:
+//   - observe which sessions have a live turn (for a tab strip rendered outside
+//     the chat hook), and
+//   - abort every in-flight turn on a hard teardown (logout).
+// The turn manager itself stays internal so its shape can evolve.
+export { subscribeBackgroundSessions, abortAllTurns } from "./turn-manager.js";
+export type { LiveTurn, LiveTurnStatus } from "./turn-manager.js";
+export { useBackgroundSessions } from "./use-background-sessions.js";
+
 // ─── Registry ─────────────────────────────────────────────────
 export { createToolRegistry } from "./tool-registry.js";
 export type { ToolEntry, ToolRegistry } from "./tool-registry.js";

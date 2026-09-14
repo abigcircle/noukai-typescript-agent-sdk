@@ -1,6 +1,6 @@
 {
   "name": "@noukai/agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Generic client-side agent framework for Noukai flows — a domain-agnostic yield/resume tool-calling loop (with an optional React hook) for browser and relay agents.",
   "type": "module",
   "main": "./dist/index.cjs",

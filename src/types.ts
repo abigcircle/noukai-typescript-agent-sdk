@@ -84,9 +84,18 @@ export interface AgentMessage {
 
 // ─── Hook Types ───────────────────────────────────────────────
 
-/** Function that resolves a tool call locally. Can be sync or async. */
+/**
+ * Function that resolves a tool call locally. Can be sync or async.
+ *
+ * `ctx.sessionId` is present when the call belongs to a background (detached)
+ * turn — so a SINGLE resolver multiplexed across many sessions can route to the
+ * right session's state instead of "whatever tab is currently focused". It is
+ * absent on the default (non-background) path. Backward compatible: a resolver
+ * that ignores the second argument keeps working unchanged.
+ */
 export type ToolResolver = (
   call: ToolCall,
+  ctx?: { sessionId?: string },
 ) => ToolResult | Promise<ToolResult>;
 
 /** Configuration for the useAgentChat hook */
@@ -106,10 +115,28 @@ export interface AgentChatOptions<M = Record<string, unknown>> {
   /** Extracts display context from a tool call (e.g. block name from blockId).
    *  The returned string is inserted into the progress label. */
   toolCallContext?: (call: ToolCall) => string | undefined;
-  /** Called when the agent returns a final message with metadata */
-  onMetadata?: (metadata: M | undefined) => void;
-  /** Called when tool calls are about to be resolved — use for progress UI */
-  onToolCallStart?: (toolCalls: ToolCall[]) => void;
+  /**
+   * Called when the agent returns a final message with metadata.
+   *
+   * `ctx.sessionId` identifies the originating session and is passed only for
+   * background (detached) turns — so a consumer multiplexing many sessions can
+   * route a backgrounded turn's metadata (e.g. pipeline operations) to the right
+   * tab's overlay even while another tab is active. Absent on the default path.
+   */
+  onMetadata?: (metadata: M | undefined, ctx?: { sessionId: string }) => void;
+  /**
+   * Called when tool calls are about to be resolved — use for progress UI.
+   * `ctx.sessionId` is passed only for background (detached) turns (see
+   * {@link onMetadata}); absent on the default path.
+   */
+  onToolCallStart?: (toolCalls: ToolCall[], ctx?: { sessionId: string }) => void;
+  /**
+   * Called when a background (detached) turn fails. Fires even while a different
+   * session is active, so a consumer can surface an error badge on a backgrounded
+   * tab. Only invoked when `backgroundTurns` is enabled; the default path surfaces
+   * errors inline as an assistant error bubble (unchanged).
+   */
+  onTurnError?: (error: Error, ctx: { sessionId: string }) => void;
   /**
    * Chat-flow mode. When true, each send passes the growing conversation as
    * structured top-level `messages` (role:user/role:assistant turns) instead of
@@ -135,6 +162,23 @@ export interface AgentChatOptions<M = Record<string, unknown>> {
    * "domain overlay" recipe in session-store.ts.
    */
   store?: import("./session-store.js").ChatSessionStore;
+  /**
+   * Opt in to **background (detached) turns**. Requires both `sessionId` and
+   * `store`.
+   *
+   * When enabled, a turn started for a session keeps running to completion even
+   * after `sessionId` changes — switching sessions no longer aborts the turn, and
+   * its result is present (from the store and/or a still-live stream) when you
+   * return. Aborting becomes explicit: `stop(sessionId?)`. Turns survive a hook
+   * unmount/remount (they live in a module-level manager); a page reload keeps
+   * only what the store persisted, exactly as before.
+   *
+   * Default `false` preserves today's behavior byte-for-byte (a `sessionId`
+   * change aborts the in-flight turn). Enabling it without a `store` is a no-op
+   * (a dev-mode warning is logged) since a detached turn needs somewhere to
+   * persist and a stable identity to run under.
+   */
+  backgroundTurns?: boolean;
 }
 
 /** Return value from the useAgentChat hook */
@@ -145,10 +189,21 @@ export interface AgentChatReturn {
   isLoading: boolean;
   /** Send a user message */
   sendMessage: (content: string) => void;
-  /** Abort the in-flight turn (e.g. user pressed Escape) so a new send is allowed. */
-  stop: () => void;
+  /**
+   * Abort an in-flight turn so a new send is allowed. With no argument, aborts
+   * the ACTIVE session's turn (e.g. user pressed Escape). With `backgroundTurns`
+   * enabled, pass a `sessionId` to abort a specific backgrounded session's turn
+   * even while another session is active.
+   */
+  stop: (sessionId?: string) => void;
   /** Clear conversation */
   clearChat: () => void;
   /** Full conversation history (for advanced use) */
   conversation: readonly AgentTurn[];
+  /**
+   * sessionIds (for this hook's `store`) that currently have an in-flight
+   * background turn — including the active session if it has one. Empty unless
+   * `backgroundTurns` is enabled. Use it to show a spinner on backgrounded tabs.
+   */
+  backgroundSessions: readonly string[];
 }

@@ -24,23 +24,21 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { runAgentLoop } from "./agent-loop.js";
 import { shouldSaveSession, isStaleLoad } from "./session-sync.js";
 import { ToolLabelFormatter } from "./tool-label-formatter.js";
+import {
+  startTurn,
+  getTurn,
+  subscribeTurn,
+  abortTurn,
+  subscribeBackgroundSessions,
+  maxMsgIdSuffix,
+} from "./turn-manager.js";
+import type { ExecutionSnapshot } from "./turn-manager.js";
 import type {
   AgentChatOptions,
   AgentChatReturn,
   AgentMessage,
   AgentTurn,
 } from "./types.js";
-
-/** Largest numeric suffix of an `msg-N` id, or 0. Keeps the id counter ahead of
- *  restored ids so a rehydrated session can't mint a colliding message id. */
-function maxMsgIdSuffix(messages: AgentMessage[]): number {
-  let max = 0;
-  for (const m of messages) {
-    const n = Number.parseInt(m.id.replace(/^msg-/, ""), 10);
-    if (Number.isFinite(n) && n > max) max = n;
-  }
-  return max;
-}
 
 const defaultFormatter = new ToolLabelFormatter();
 
@@ -59,8 +57,20 @@ export function useAgentChat<M = Record<string, unknown>>(
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
+  // Mirror of `messages` for synchronous reads in sendMessage — background mode
+  // snapshots the current display as the new turn's baseline.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+
+  // sessionIds (for this store) with an in-flight background turn — for tab UI.
+  const [backgroundSessions, setBackgroundSessions] = useState<string[]>([]);
+
   // ── Optional session persistence (sessionId + store) ─────
-  const { sessionId, store } = options;
+  const { sessionId, store, backgroundTurns } = options;
+  // Background (detached) turns need a store (somewhere to persist) and a
+  // sessionId (a stable identity to run under). Enabled only when all three line
+  // up; otherwise every path below is the original, byte-for-byte behavior.
+  const bgEnabled = Boolean(backgroundTurns) && store != null && sessionId != null;
   // Monotonic token so a slow load() for a since-abandoned session is ignored.
   const loadSeqRef = useRef(0);
   // The sessionId whose data currently populates messages/conversation. The save
@@ -83,7 +93,47 @@ export function useAgentChat<M = Record<string, unknown>>(
 
   const sendMessage = useCallback(
     async (content: string) => {
-      if (!content.trim() || isLoading) return;
+      if (!content.trim()) return;
+
+      // ── Background (detached) turn path ──────────────────────
+      // The turn runs in the module-level manager, NOT this hook — so it survives
+      // sessionId changes and unmount. The subscription effect (below) drives
+      // `messages` + `isLoading` from the manager's live record; nothing is set
+      // inline here. The execution context (endpoint, tools, resolver, callbacks)
+      // is snapshotted now so a later tab switch can't change what a backgrounded
+      // turn uses.
+      const o = optionsRef.current;
+      if (Boolean(o.backgroundTurns) && o.store != null && o.sessionId != null) {
+        // Per-session single-flight: ignore a re-send while a turn is already live.
+        if (getTurn(o.store, o.sessionId)) return;
+        const snapshot: ExecutionSnapshot = {
+          endpoint: o.endpoint,
+          tools: o.tools,
+          resolveToolCall: o.resolveToolCall,
+          ...(o.maxIterations !== undefined
+            ? { maxIterations: o.maxIterations }
+            : {}),
+          formatter: o.toolLabelFormatter ?? defaultFormatter,
+          ...(o.toolCallContext !== undefined
+            ? { toolCallContext: o.toolCallContext }
+            : {}),
+          sendStructuredMessages: o.sendStructuredMessages ?? false,
+          conversation: [...conversationRef.current],
+          displayMessages: messagesRef.current,
+          createdAt: createdAtRef.current,
+          ...(o.onToolCallStart !== undefined
+            ? { onToolCallStart: o.onToolCallStart }
+            : {}),
+          ...(o.onMetadata !== undefined
+            ? { onMetadata: o.onMetadata as ExecutionSnapshot["onMetadata"] }
+            : {}),
+          ...(o.onTurnError !== undefined ? { onTurnError: o.onTurnError } : {}),
+        };
+        startTurn(o.store, o.sessionId, snapshot, content);
+        return;
+      }
+
+      if (isLoading) return;
 
       // Abort any previous in-flight request
       abortRef.current?.abort();
@@ -204,15 +254,29 @@ export function useAgentChat<M = Record<string, unknown>>(
   // Abort the in-flight loop. The pending fetch rejects with AbortError, which
   // sendMessage's catch swallows; setting isLoading false here re-enables the
   // composer immediately instead of waiting for that rejection to settle.
-  const stop = useCallback(() => {
+  const stop = useCallback((sessionId?: string) => {
+    const o = optionsRef.current;
+    if (Boolean(o.backgroundTurns) && o.store != null) {
+      // Background mode: abort a specific session's turn (defaults to the active
+      // one). The subscription flips isLoading when the abort finalizes; clear it
+      // eagerly too when aborting the active session for an instant composer.
+      const target = sessionId ?? o.sessionId;
+      if (target != null) abortTurn(o.store, target);
+      if (target === o.sessionId) setIsLoading(false);
+      return;
+    }
     abortRef.current?.abort();
     setIsLoading(false);
   }, []);
 
   // ── Session Load (restore on mount / sessionId change) ────
   // With a store + sessionId, restore that session's conversation + display.
-  // Switching sessionId aborts any in-flight turn and swaps to the new session,
-  // so a multi-session UI (tabs) gets restore for free by changing the id.
+  //
+  // Default: switching sessionId aborts any in-flight turn and swaps to the new
+  // session, so a multi-session UI (tabs) gets restore for free by changing the
+  // id. Background mode: switching NEVER aborts — the turn keeps running in the
+  // module manager. If the new session has a live turn, the subscription effect
+  // (below) owns the view, so we don't overwrite it with a store load.
   useEffect(() => {
     if (!store || sessionId == null) {
       // No persistence: whatever is in memory belongs to "no session".
@@ -221,15 +285,44 @@ export function useAgentChat<M = Record<string, unknown>>(
       return;
     }
     const seq = ++loadSeqRef.current;
-    // Leaving the current session mid-turn: drop the in-flight request.
-    abortRef.current?.abort();
+    const background = Boolean(optionsRef.current.backgroundTurns);
+    // Default path aborts the outgoing turn; background path leaves it running.
+    if (!background) abortRef.current?.abort();
+    // Reset the composer; the subscription re-derives isLoading from any live
+    // turn for the incoming session (background mode).
     setIsLoading(false);
+
+    if (background) {
+      // A live turn for the incoming session takes over via the subscription;
+      // seed the refs from its record so save-gating / id-minting stay consistent
+      // and skip the store load (it would clobber the live display).
+      const live = getTurn(store, sessionId);
+      if (live) {
+        conversationRef.current = [...live.conversation];
+        createdAtRef.current = live.createdAt;
+        messageIdCounter.current = Math.max(
+          messageIdCounter.current,
+          maxMsgIdSuffix(live.displayMessages),
+        );
+        hydratedIdRef.current = sessionId;
+        isDirtyRef.current = false;
+        return;
+      }
+    }
+
     let cancelled = false;
     Promise.resolve(store.load(sessionId))
       .then((session) => {
         // Ignore a resolved load that a newer sessionId change superseded.
         if (cancelled || isStaleLoad({ loadSeqAtStart: seq, currentLoadSeq: loadSeqRef.current }))
           return;
+        // Background: a turn may have STARTED for this session during the async
+        // load — it owns the view now, so don't clobber it with stale store data.
+        if (background && getTurn(store, sessionId)) {
+          hydratedIdRef.current = sessionId;
+          isDirtyRef.current = false;
+          return;
+        }
         if (session) {
           setMessages(session.displayMessages);
           conversationRef.current = [...session.conversation];
@@ -250,6 +343,11 @@ export function useAgentChat<M = Record<string, unknown>>(
       .catch(() => {
         if (cancelled || isStaleLoad({ loadSeqAtStart: seq, currentLoadSeq: loadSeqRef.current }))
           return;
+        if (background && getTurn(store, sessionId)) {
+          hydratedIdRef.current = sessionId;
+          isDirtyRef.current = false;
+          return;
+        }
         // A failed load starts the session empty rather than stranding it.
         setMessages([]);
         conversationRef.current = [];
@@ -260,7 +358,51 @@ export function useAgentChat<M = Record<string, unknown>>(
     return () => {
       cancelled = true;
     };
-  }, [sessionId, store]);
+  }, [sessionId, store, backgroundTurns]);
+
+  // ── Background turn subscription (active session) ─────────
+  // Mirrors the active session's live turn record into messages + isLoading.
+  // cb(turn) always wins; cb(undefined) is a no-op so the loaded store baseline
+  // stands. A no-op unless background mode is on.
+  useEffect(() => {
+    if (!bgEnabled || !store || sessionId == null) return;
+    return subscribeTurn(store, sessionId, (turn) => {
+      if (!turn) return;
+      setMessages(turn.displayMessages);
+      setIsLoading(turn.status === "running");
+      if (turn.status !== "running") {
+        // Terminal: the manager persisted this turn; keep the ref in sync so a
+        // subsequent send builds on the completed conversation.
+        conversationRef.current = [...turn.conversation];
+      }
+    });
+  }, [bgEnabled, store, sessionId]);
+
+  // ── Background turns live-set (for tab spinners) ─────────
+  useEffect(() => {
+    if (!backgroundTurns || store == null) {
+      // Clear only if non-empty — returning the same reference lets React bail on
+      // the update, so a flag-off consumer gets no extra render on mount.
+      setBackgroundSessions((prev) => (prev.length ? [] : prev));
+      return;
+    }
+    return subscribeBackgroundSessions(store, setBackgroundSessions);
+  }, [backgroundTurns, store]);
+
+  // ── Dev nudge: backgroundTurns needs a store + sessionId ──
+  useEffect(() => {
+    if (!backgroundTurns || (store != null && sessionId != null)) return;
+    // Read NODE_ENV via globalThis so this stays browser/SSR-safe (no bare
+    // `process` reference). Warn only outside production.
+    const nodeEnv = (
+      globalThis as { process?: { env?: { NODE_ENV?: string } } }
+    ).process?.env?.NODE_ENV;
+    if (nodeEnv !== "production") {
+      console.warn(
+        "[useAgentChat] `backgroundTurns` requires both `sessionId` and `store`; running turns inline instead.",
+      );
+    }
+  }, [backgroundTurns, store, sessionId]);
 
   // ── Unmount cleanup ──────────────────────────────────────
   // A1: abort any in-flight turn when the component finally unmounts. Without
@@ -268,7 +410,16 @@ export function useAgentChat<M = Record<string, unknown>>(
   // resolveToolCall (real side effects), and calls setMessages/setIsLoading on an
   // unmounted component. Empty deps → fires only on final unmount, so it does not
   // interfere with the per-send / per-sessionId abort logic above.
-  useEffect(() => () => abortRef.current?.abort(), []);
+  //
+  // Background turns intentionally SURVIVE unmount — they live in the module
+  // manager (an unmounted hook has unsubscribed, so there is no stray setState,
+  // and continued resolveToolCall is the feature). Only the inline path aborts.
+  useEffect(
+    () => () => {
+      if (!optionsRef.current.backgroundTurns) abortRef.current?.abort();
+    },
+    [],
+  );
 
   // ── Session Save (persist each settled exchange) ──────────
   // Fires on display changes, but only when this session is loaded (guards the
@@ -276,6 +427,9 @@ export function useAgentChat<M = Record<string, unknown>>(
   // never persisted.
   useEffect(() => {
     if (!store || sessionId == null) return;
+    // Background mode persists via the manager on turn completion — the hook's
+    // own save would double-write (and race the manager). Leave it to the manager.
+    if (backgroundTurns) return;
     const displayMessages = messages.filter((m) => m.role !== "thinking");
     // Save-gate decision (pure — see session-sync.ts). Blocks the write during
     // the tab-switch window (hydratedId mismatch), while a turn is in flight,
@@ -307,11 +461,16 @@ export function useAgentChat<M = Record<string, unknown>>(
         updatedAt: now,
       }),
     ).catch(() => undefined);
-  }, [messages, isLoading, sessionId, store]);
+  }, [messages, isLoading, sessionId, store, backgroundTurns]);
 
   // ── Clear Chat ───────────────────────────────────────────
 
   const clearChat = useCallback(() => {
+    const { sessionId: sid, store: st, backgroundTurns: bg } = optionsRef.current;
+    // Background: discard any in-flight turn for this session BEFORE the delete,
+    // so its (removed) record can't resurrect the session via a terminal save.
+    // finalizeAbort notifies `undefined`, so it won't repopulate the cleared view.
+    if (Boolean(bg) && st != null && sid != null) abortTurn(st, sid);
     setMessages([]);
     conversationRef.current = [];
     createdAtRef.current = null;
@@ -319,7 +478,6 @@ export function useAgentChat<M = Record<string, unknown>>(
     // the (now empty) save effect is separately blocked by the empty-content
     // guard, so this never re-saves an empty session over the delete.
     isDirtyRef.current = true;
-    const { sessionId: sid, store: st } = optionsRef.current;
     if (st && sid != null) Promise.resolve(st.delete(sid)).catch(() => undefined);
   }, []);
 
@@ -332,5 +490,6 @@ export function useAgentChat<M = Record<string, unknown>>(
     stop,
     clearChat,
     conversation: conversationRef.current,
+    backgroundSessions,
   };
 }
