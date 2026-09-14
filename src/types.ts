@@ -97,7 +97,7 @@ export interface AgentChatOptions<M = Record<string, unknown>> {
   tools: ToolDefinition[];
   /** Function to resolve tool calls locally */
   resolveToolCall: ToolResolver;
-  /** Max tool-calling loop iterations (default: 5) */
+  /** Max tool-calling loop iterations (default: 10) */
   maxIterations?: number;
   /** Formatter for tool-call progress labels. Pass a custom ToolLabelFormatter
    *  to control the verbs shown during tool resolution (e.g. whimsical labels).
@@ -117,6 +117,24 @@ export interface AgentChatOptions<M = Record<string, unknown>> {
    * the existing behavior byte-identical.
    */
   sendStructuredMessages?: boolean;
+  /**
+   * Session identity for optional persistence. When set together with `store`,
+   * the hook loads this session's `{ conversation, displayMessages }` on mount
+   * and whenever `sessionId` changes (switching sessions/tabs restores that
+   * conversation), saves after each completed exchange, and deletes on
+   * `clearChat`. Changing `sessionId` aborts any in-flight turn. Omit for the
+   * default in-memory-only behavior.
+   */
+  sessionId?: string;
+  /**
+   * Pluggable persistence backend. See {@link import("./session-store.js").ChatSessionStore}.
+   * MUST be referentially stable across renders (memoize it) — a new object each
+   * render re-triggers the load effect. Pair with `sessionId`. Only
+   * `conversation` + `displayMessages` are persisted here; app-specific overlay
+   * state (pending ops, etc.) is the consumer's own concern — see the
+   * "domain overlay" recipe in session-store.ts.
+   */
+  store?: import("./session-store.js").ChatSessionStore;
 }
 
 /** Return value from the useAgentChat hook */

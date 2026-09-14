@@ -1,41 +1,49 @@
 /**
- * runAgentLoop — Slug execute pause/resume tool-calling loop
+ * runAgentLoop — the slug execute pause/resume tool-calling loop.
  *
- * Implements the native tool-calling protocol for the slug /execute
- * endpoint. The server is stateless — all execution context (toolCallMessages,
- * executionId, etc.) is passed back and forth between client and server.
+ * As of the agent-relay rewire (design 20260903-SDK-agent-relay, PR-3) this is
+ * a thin adapter over `@noukai/sdk`'s `createRelayFlow` — the yield/resume loop,
+ * the request/response models, and the round limit now live in ONE place (the
+ * SDK). This package no longer re-declares the wire response shapes
+ * (`PausedResponse`/`CompletedResponse`) or the loop; it maps the SDK's
+ * `ExecuteResult`/`PausedResult` into `@noukai/agent`'s public
+ * `AgentLoopResult`, and keeps this package's value-adds: local tool resolution,
+ * duplicate-call de-duplication, `onToolCallStart` progress hooks, both fresh
+ * request modes (`message` vs structured `messages`), and the `extractResult`
+ * unwrapping.
  *
- * Flow:
- *   1. POST { message, tools, parameters? } (fresh call)
- *   2. If status "tool_calls_required":
- *      - Resolve tool calls locally via the provided resolver
- *      - Append tool result messages to toolCallMessages
- *      - POST { executionId, pausedAtStep, iterationsUsed, toolCallMessages, tools }
- *      - Repeat from 2
- *   3. If status "completed": return result
- *
- * The hook (`useAgentChat`) wraps this with React state management,
- * display messages, and abort handling.
+ * The public surface (`runAgentLoop`, `AgentLoopOptions`, `AgentLoopResult`) is
+ * unchanged. Behavior deltas from the previous hand-rolled loop (all documented
+ * in CHANGELOG): the client round limit is now the SDK's 10 (was 12); errors are
+ * the SDK's typed `NoukaiError` subclasses (still `instanceof Error`); resume
+ * requests carry the SDK's standard fields (server-ignored).
  */
 
+import {
+  createRelayFlow,
+  ToolCallLimitError,
+  FlowExecutionError,
+  NoukaiError,
+} from "@noukai/sdk";
 import type { AgentTurn, ToolCall, ToolDefinition, ToolResolver, ToolResult } from "./types.js";
 import {
   toWireToolDefs,
   parseWireToolCall,
   toWireToolResult,
+  toChatMessages,
 } from "./wire-adapters.js";
-import type { WireToolCall, WireToolResult } from "./wire-adapters.js";
+import type { WireToolCall } from "./wire-adapters.js";
 
 // ─── Types ───────────────────────────────────────────────────
 
 export interface AgentLoopOptions<M = Record<string, unknown>> {
-  /** API endpoint to POST to (BFF route) */
+  /** API endpoint to POST to (BFF relay route) */
   endpoint: string;
   /** Tool definitions in internal format (converted to OpenAI format on the wire) */
   tools: ToolDefinition[];
   /** Function to resolve tool calls locally */
   resolveToolCall: ToolResolver;
-  /** Max tool-calling loop iterations (default: 12) */
+  /** Max tool-calling loop rounds (default: 10 — the SDK's `DEFAULT_MAX_TOOL_ROUNDS`) */
   maxIterations?: number;
   /** Abort signal (optional) */
   signal?: AbortSignal;
@@ -60,32 +68,10 @@ export type AgentLoopResult<M = Record<string, unknown>> =
   | { type: "message"; content: string; metadata?: M }
   | { type: "max_iterations" };
 
-// ─── Backend Response Shapes ─────────────────────────────────
-
-interface PausedResponse {
-  status: "tool_calls_required";
-  executionId: string;
-  pausedAtStep: string;
-  iterationsUsed: number;
-  toolCallMessages: Record<string, unknown>[];
-  toolCalls: WireToolCall[];
-  accumulatedOutputs: Record<string, unknown>;
-  flowId: string;
-  blockCount: number;
-}
-
-interface CompletedResponse {
-  status: "completed";
-  result: unknown;
-  flowId: string;
-  blockCount: number;
-}
-
-type SlugResponse = PausedResponse | CompletedResponse;
-
 // ─── Loop ────────────────────────────────────────────────────
 
-const DEFAULT_MAX_ITERATIONS = 12;
+/** The client round limit. Reconciled to the SDK's `DEFAULT_MAX_TOOL_ROUNDS` (was 12). */
+const DEFAULT_MAX_ITERATIONS = 10;
 
 export async function runAgentLoop<M = Record<string, unknown>>(
   message: string,
@@ -97,122 +83,138 @@ export async function runAgentLoop<M = Record<string, unknown>>(
     resolveToolCall,
     maxIterations = DEFAULT_MAX_ITERATIONS,
     signal,
-    fetch: fetchFn = globalThis.fetch,
+    fetch: fetchFn,
     onToolCallStart,
     parameters,
     toolChoice,
     messages,
   } = options;
 
+  // WireToolDef carries an index signature, so it is structurally a
+  // Record<string, unknown> — no `as unknown` cast needed at the SDK seam.
   const wireTools = toWireToolDefs(tools);
 
-  // Track resolved tool calls to skip duplicate resolver invocations.
-  // Key: "toolName:serializedArgs" → cached result string.
+  // Local tool resolution, keeping this package's dedup + progress-hook value-adds.
+  // Key: "toolName:serializedArgs" → cached result string (persists across rounds).
   const resolvedCache = new Map<string, string>();
 
+  const toolHandler = async (
+    rawCalls: Record<string, unknown>[],
+  ): Promise<Record<string, unknown>[]> => {
+    const allCalls = rawCalls.map((c) => parseWireToolCall(c as unknown as WireToolCall));
+
+    const cached: { call: ToolCall; result: string }[] = [];
+    const fresh: ToolCall[] = [];
+    for (const call of allCalls) {
+      const key = `${call.name}:${JSON.stringify(call.arguments)}`;
+      const hit = resolvedCache.get(key);
+      if (hit !== undefined) cached.push({ call, result: hit });
+      else fresh.push(call);
+    }
+
+    const results: Record<string, unknown>[] = [];
+    // Cached results first (matches the previous loop's ordering).
+    for (const { call, result } of cached) {
+      results.push(toWireToolResult(call.id, result));
+    }
+    // Resolve fresh calls one at a time, notifying before each so thinking
+    // labels appear sequentially.
+    for (const call of fresh) {
+      onToolCallStart?.([call]);
+      const result: ToolResult = await Promise.resolve(resolveToolCall(call));
+      const key = `${call.name}:${JSON.stringify(call.arguments)}`;
+      resolvedCache.set(key, result.result);
+      results.push(toWireToolResult(call.id, result.result));
+    }
+    return results;
+  };
+
+  const flow = createRelayFlow({
+    url: endpoint,
+    ...(fetchFn !== undefined ? { fetch: fetchFn } : {}),
+  });
+
   // Fresh call. Chat-flow mode sends structured `messages`; the default (Nana)
-  // path sends `message` + `parameters.conversation`. Resume shape is shared.
-  let body: Record<string, unknown> =
-    messages != null
-      ? {
-          messages,
-          tools: wireTools,
-          ...(toolChoice != null ? { toolChoice } : {}),
-        }
-      : {
-          message,
-          tools: wireTools,
-          ...(toolChoice != null ? { toolChoice } : {}),
-          ...(parameters != null ? { parameters } : {}),
-        };
+  // path sends `message` + `parameters`. Resume shape is owned by the SDK loop.
+  const common = {
+    tools: wireTools,
+    ...(toolChoice != null ? { toolChoice } : {}),
+    toolHandler,
+    maxToolRounds: maxIterations,
+    ...(signal !== undefined ? { signal } : {}),
+  };
 
-  for (let i = 0; i < maxIterations; i++) {
-    const response = await fetchFn(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
-    });
+  try {
+    const result =
+      messages != null
+        ? await flow.execute({ messages: toChatMessages(messages), ...common })
+        : await flow.execute({
+            message,
+            ...(parameters != null ? { parameters } : {}),
+            ...common,
+          });
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      const detail = errorData as Record<string, unknown>;
-      const errorMsg =
-        (detail.detail as Record<string, unknown>)?.message ??
-        detail.error ??
-        `API error: ${response.status} ${response.statusText}`;
-      throw new Error(String(errorMsg));
+    // Defensive guard for the no-handler case: with a `toolHandler` passed (as
+    // we always do here) the SDK loop auto-resumes to a terminal result or
+    // throws ToolCallLimitError, so a residual pause is unreachable. Kept — not
+    // removed — to preserve the type-narrowing on `result` for the code below.
+    if (result.requiresToolCalls) {
+      return { type: "max_iterations" };
     }
-
-    const data = (await response.json()) as SlugResponse;
-
-    // ── Completed ─────────────────────────────────────────
-    if (data.status === "completed") {
-      return extractResult<M>(data.result);
+    // A flow that completes with status:"failed" (HTTP 200) is an execution
+    // failure, not a message. The pre-rewire loop threw on any status that was
+    // neither "completed" nor "tool_calls_required"; preserve that contract so
+    // a failed run is not silently surfaced as an (often empty) assistant
+    // message. (design 20260903-SDK-agent-relay, PR-3 — regression fix.)
+    if (result.status === "failed") {
+      const detail = result.result !== undefined ? `: ${JSON.stringify(result.result)}` : "";
+      throw new FlowExecutionError(`Flow execution failed${detail}`, {
+        statusCode: 200,
+        responseBody: result.result,
+        code: "FLOW_EXECUTION_FAILED",
+      });
     }
-
-    // ── Paused for tool calls ─────────────────────────────
-    if (data.status === "tool_calls_required") {
-      const allCalls = data.toolCalls.map(parseWireToolCall);
-
-      // Deduplicate: skip resolver for tool calls already seen with identical args
-      const fresh: ToolCall[] = [];
-      const cached: { call: ToolCall; result: string }[] = [];
-
-      for (const call of allCalls) {
-        const key = `${call.name}:${JSON.stringify(call.arguments)}`;
-        const hit = resolvedCache.get(key);
-        if (hit !== undefined) {
-          cached.push({ call, result: hit });
-        } else {
-          fresh.push(call);
-        }
-      }
-
-      // Build tool result messages to append to the server's toolCallMessages
-      const toolResultMessages: WireToolResult[] = [];
-
-      // Append cached results
-      for (const { call, result } of cached) {
-        toolResultMessages.push(toWireToolResult(call.id, result));
-      }
-
-      // Resolve fresh tool calls one at a time, notifying before each so
-      // thinking labels appear sequentially.
-      for (const call of fresh) {
-        onToolCallStart?.([call]);
-        const result: ToolResult = await Promise.resolve(resolveToolCall(call));
-        const key = `${call.name}:${JSON.stringify(call.arguments)}`;
-        resolvedCache.set(key, result.result);
-        toolResultMessages.push(toWireToolResult(call.id, result.result));
-      }
-
-      // Build resume request — echo back server state + append our tool results
-      body = {
-        executionId: data.executionId,
-        pausedAtStep: data.pausedAtStep,
-        iterationsUsed: data.iterationsUsed,
-        toolCallMessages: [
-          ...data.toolCallMessages,
-          ...toolResultMessages.map((m) => ({ ...m })),
-        ],
-        accumulatedOutputs: data.accumulatedOutputs,
-        tools: wireTools,
-      };
-
-      continue;
+    return extractResult<M>(result.result);
+  } catch (err) {
+    // The SDK throws ToolCallLimitError at the client round limit; the public
+    // contract here is the `max_iterations` sentinel, not a throw.
+    if (err instanceof ToolCallLimitError) {
+      return { type: "max_iterations" };
     }
-
-    // ── Unknown status ────────────────────────────────────
-    throw new Error(
-      `Unexpected response status: ${(data as Record<string, unknown>).status}`,
-    );
+    throw withFriendlyMessage(err);
   }
-
-  return { type: "max_iterations" };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
+
+/**
+ * Recover a friendly server message the SDK's error mapping dropped.
+ *
+ * The SDK only lifts `detail.message` onto the error when the body carries BOTH
+ * a string `code` AND a string `message` (`parseErrorDetail`). A
+ * `{detail:{message}}` body *without* a `code` therefore regresses to the SDK's
+ * generic fallback (the JSON-stringified body / `HTTP <status>`). When the
+ * caught error carries no `code`, prefer the body's `detail.message` so the
+ * user-facing text stays friendly. When a `code` IS present the SDK already
+ * surfaced `detail.message` — leave it untouched (existing behavior).
+ */
+function withFriendlyMessage(err: unknown): unknown {
+  if (!(err instanceof NoukaiError) || err.code !== undefined) return err;
+  const friendly = detailMessage(err.responseBody) ?? detailMessage(err);
+  if (friendly !== undefined && friendly !== err.message) {
+    err.message = friendly;
+  }
+  return err;
+}
+
+/** Read a string `detail.message` off an unknown value, or undefined. */
+function detailMessage(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const detail = (value as { detail?: unknown }).detail;
+  if (detail === null || typeof detail !== "object") return undefined;
+  const message = (detail as { message?: unknown }).message;
+  return typeof message === "string" ? message : undefined;
+}
 
 /**
  * Extract content and metadata from the flow's `result` field.

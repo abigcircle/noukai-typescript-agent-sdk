@@ -1,6 +1,6 @@
 {
   "name": "@noukai/agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Generic client-side agent framework for Noukai flows — a domain-agnostic yield/resume tool-calling loop (with an optional React hook) for browser and relay agents.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -18,37 +18,60 @@
       }
     }
   },
-  "engines": { "node": ">=18.0.0" },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "sideEffects": false,
-  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "license": "MIT",
   "homepage": "https://noukai.dev",
-  "repository": { "type": "git", "url": "git+https://github.com/abigcircle/noukai-typescript-agent-sdk.git" },
-  "bugs": { "url": "https://github.com/abigcircle/noukai-typescript-agent-sdk/issues" },
-  "publishConfig": { "access": "public" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abigcircle/noukai-typescript-agent-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/abigcircle/noukai-typescript-agent-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest run",
+    "test": "vitest run --exclude \"**/*.integration.test.ts\"",
+    "test:integration": "vitest run tests/agent-loop.integration.test.ts",
     "test:watch": "vitest",
     "check-types": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write .",
     "prepublishOnly": "pnpm build && pnpm check-types && pnpm test"
   },
+  "dependencies": {
+    "@noukai/sdk": "^0.4.0"
+  },
   "peerDependencies": {
     "react": "^18.0.0"
   },
   "peerDependenciesMeta": {
-    "react": { "optional": true }
+    "react": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@eslint/js": "^9",
+    "@types/express": "^5.0.6",
     "@types/react": "^18.2.20",
     "@typescript-eslint/eslint-plugin": "^8",
     "@typescript-eslint/parser": "^8",
+    "dotenv": "^17.4.2",
     "eslint": "^9",
     "eslint-config-prettier": "^10",
+    "express": "^5.2.1",
     "prettier": "^3",
     "tsup": "^8",
     "typescript": "^5.5",

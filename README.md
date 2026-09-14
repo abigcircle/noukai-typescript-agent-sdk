@@ -36,10 +36,15 @@ yarn add @noukai/agent
 ```
 
 Ships **ESM + CJS** with type declarations. Requires a modern runtime with
-`fetch` and `AbortController` (Node 18+, browsers, Bun, Deno).
+`fetch` and `AbortController` (Node 18+, browsers, Bun, Deno). Prefer ESM: the
+package depends on `@noukai/sdk` (ESM-only), so `require()`-ing this package on
+Node < 22.12 (no `require(esm)`) needs an ESM consumer or a bundler.
 
-`react ^18` is an **optional** peer dependency — install it only if you use the
-`useAgentChat` hook. The pure `runAgentLoop` has no React dependency.
+`@noukai/sdk` (`^0.5.0`) is a dependency — as of `0.2.0` the yield/resume loop,
+the request/response models, and the round limit come from the SDK
+(`createRelayFlow`); this package adds local tool resolution, dedup, progress
+labels, and the React hook on top. `react ^18` is an **optional** peer — install
+it only if you use `useAgentChat`. The pure `runAgentLoop` has no React dependency.
 
 ## Quick start (React)
 
@@ -210,6 +215,13 @@ returns one of two shapes:
 The `metadata` channel on a final message is generic (`M`) — use it to pass
 structured data (e.g. pending operations) alongside the chat text without
 polluting the message content.
+
+> **Building the keyholder relay this endpoint points at?** This package is the
+> browser half. The server half — a verbatim relay that holds `nk_`, bounds
+> abuse, and runs your `authorize` hook — plus the full wire contract and an
+> implementation checklist live in the SDK relay guide:
+> [`@noukai/sdk` docs/AGENT_RELAY.md](../noukai-typescript-sdk/docs/AGENT_RELAY.md)
+> (Python: [`noukai-sdk` docs/AGENT_RELAY.md](../noukai-python-sdk/docs/AGENT_RELAY.md)).
 
 ## Scripts
 

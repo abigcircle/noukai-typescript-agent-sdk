@@ -202,3 +202,98 @@ export interface ChatSessionSummary {
   createdAt: string;
   updatedAt: string;
 }
+
+// ─── Default In-Memory Store ───────────────────────────────────
+
+/**
+ * Zero-config store that keeps sessions in a `Map` for the lifetime of the
+ * instance. Nothing survives a reload — it exists so `useAgentChat({ store })`
+ * works out of the box, and as a reference implementation for a real backend.
+ *
+ * This is an in-memory DEV/REFERENCE store: it has NO eviction (the Map grows
+ * unbounded for the lifetime of the instance) and is NOT intended as production
+ * persistence. For that, implement {@link ChatSessionStore} against localStorage,
+ * IndexedDB, AsyncStorage, or a database — the shape is identical, only the
+ * read/write calls change.
+ */
+export class MemorySessionStore implements ChatSessionStore {
+  private readonly sessions = new Map<string, ChatSession>();
+
+  // Sync bodies wrapped in resolved Promises — the interface is async so any
+  // backend (DB, network) fits, but an in-memory Map has nothing to await.
+  // save/load deep-clone via structuredClone so a caller mutating a loaded (or
+  // previously saved) session can't reach in and mutate the stored copy — a real
+  // serializing backend would give the same isolation for free.
+  load(sessionId: string): Promise<ChatSession | null> {
+    const stored = this.sessions.get(sessionId);
+    return Promise.resolve(stored ? structuredClone(stored) : null);
+  }
+
+  save(session: ChatSession): Promise<void> {
+    this.sessions.set(session.sessionId, structuredClone(session));
+    return Promise.resolve();
+  }
+
+  delete(sessionId: string): Promise<void> {
+    this.sessions.delete(sessionId);
+    return Promise.resolve();
+  }
+
+  list(): Promise<ChatSessionSummary[]> {
+    return Promise.resolve(
+      [...this.sessions.values()].map((s) => ({
+        sessionId: s.sessionId,
+        title:
+          s.conversation.find((t) => t.role === "user")?.content ?? "New chat",
+        messageCount: s.conversation.filter((t) => t.role === "user").length,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+      })),
+    );
+  }
+}
+
+/*
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │ RECIPE: persisting DOMAIN state alongside a session ("overlay")  │
+ * │                                                                  │
+ * │ A ChatSession only holds what the agent framework understands:   │
+ * │ `conversation` (LLM turns) and `displayMessages` (rendered chat).│
+ * │ Your app usually has MORE per-session state the framework knows  │
+ * │ nothing about — pending actions awaiting confirmation, a toggle  │
+ * │ like "auto-apply", inline diff/preview cards, a draft input.     │
+ * │                                                                  │
+ * │ Don't try to cram that into ChatSession. Keep the framework      │
+ * │ store generic and persist your overlay in a SECOND store keyed   │
+ * │ by the SAME sessionId. Restore it whenever sessionId changes.    │
+ * └─────────────────────────────────────────────────────────────────┘
+ *
+ * If you are an LLM/codegen assistant wiring this up in a consumer app,
+ * follow these steps verbatim:
+ *
+ *   1. Define your overlay type — everything per-session the agent doesn't own:
+ *        interface MyOverlay { pendingActions: Action[]; autoApply: boolean }
+ *
+ *   2. Persist it in your own store, keyed by sessionId (mirror the backend
+ *      you gave the agent — localStorage, IndexedDB, etc.):
+ *        overlayStore.save(sessionId, overlay)   // on every overlay change
+ *        overlayStore.load(sessionId)            // returns MyOverlay | null
+ *
+ *   3. Feed the agent the same id and its (framework) store:
+ *        const agent = useAgentChat({ ...opts, sessionId, store });
+ *
+ *   4. Restore the overlay whenever the session changes, into YOUR OWN React
+ *      state (this is 100% reliable — it is state your app owns, unlike the
+ *      agent's internal messages/conversation):
+ *        useEffect(() => {
+ *          setOverlay(overlayStore.load(sessionId) ?? emptyOverlay());
+ *        }, [sessionId]);
+ *
+ *   5. Render agent.messages + your overlay together. Switching sessionId now
+ *      restores BOTH the conversation (framework) and your overlay (app) — no
+ *      reaching into agent internals, no re-implementing the agent's persistence.
+ *
+ * WHY a second store instead of one generic ChatSession<Extra>? Because the
+ * framework store stays domain-free and reusable, and your overlay stays fully
+ * typed and owned by your app. The only coupling is the shared sessionId.
+ */

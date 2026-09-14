@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { FlowExecutionError } from "@noukai/sdk";
 import { runAgentLoop } from "../src/agent-loop";
 import type { ToolCall, ToolResult } from "../src/types";
 
@@ -12,16 +13,19 @@ const TOOLS = [
   },
 ];
 
-/** Create a mock fetch that returns a sequence of responses */
+/** Create a mock fetch that returns a sequence of responses (clamps to the last
+ * when exhausted, so a loop that keeps pausing doesn't read `undefined`). */
 function mockFetch(responses: Array<Record<string, unknown>>) {
   let callIndex = 0;
   const fn = vi.fn(async () => {
-    const data = responses[callIndex++];
+    const data = responses[Math.min(callIndex++, responses.length - 1)];
     return {
       ok: true,
       status: 200,
       statusText: "OK",
-      json: async () => data,
+      // Fresh object per call — real HTTP parses a new body each time, and the
+      // SDK loop mutates the response object (non-configurable marker props).
+      json: async () => JSON.parse(JSON.stringify(data)),
     } as Response;
   });
   return fn;
@@ -121,7 +125,7 @@ describe("runAgentLoop", () => {
           {
             role: "assistant",
             content: null,
-            tool_calls: [
+            toolCalls: [
               {
                 id: "tc-1",
                 type: "function",
@@ -176,7 +180,7 @@ describe("runAgentLoop", () => {
     expect(resumeBody.toolCallMessages).toHaveLength(3);
     expect(resumeBody.toolCallMessages[2]).toEqual({
       role: "tool",
-      tool_call_id: "tc-1",
+      toolCallId: "tc-1",
       content: "resolved:get_data",
     });
     // Tools are resent on resume
@@ -223,8 +227,8 @@ describe("runAgentLoop", () => {
     // Resume should have 2 tool result messages appended
     const resumeBody = JSON.parse(fetch.mock.calls[1][1].body);
     expect(resumeBody.toolCallMessages).toHaveLength(2);
-    expect(resumeBody.toolCallMessages[0].tool_call_id).toBe("tc-1");
-    expect(resumeBody.toolCallMessages[1].tool_call_id).toBe("tc-2");
+    expect(resumeBody.toolCallMessages[0].toolCallId).toBe("tc-1");
+    expect(resumeBody.toolCallMessages[1].toolCallId).toBe("tc-2");
   });
 
   it("handles multiple rounds of tool calls", async () => {
@@ -309,15 +313,19 @@ describe("runAgentLoop", () => {
     });
 
     expect(result).toEqual({ type: "max_iterations" });
-    expect(fetch).toHaveBeenCalledTimes(3);
+    // SDK round semantics: 1 fresh call + `maxIterations` resume rounds, then
+    // the loop hits the limit and runAgentLoop returns the sentinel.
+    expect(fetch).toHaveBeenCalledTimes(4);
   });
 
-  it("throws on non-ok HTTP response", async () => {
+  it("throws the SDK's typed error on a non-ok HTTP response, preserving the message", async () => {
+    // The SDK maps a standard `{detail:{code,message}}` error body to a typed
+    // NoukaiError whose `.message` is the server's detail.message.
     const fetch = vi.fn(async () => ({
       ok: false,
       status: 500,
       statusText: "Internal Server Error",
-      json: async () => ({ detail: { message: "Server error" } }),
+      json: async () => ({ detail: { code: "INTERNAL_ERROR", message: "Server error" } }),
     })) as unknown as typeof globalThis.fetch;
 
     await expect(
@@ -330,7 +338,7 @@ describe("runAgentLoop", () => {
     ).rejects.toThrow("Server error");
   });
 
-  it("throws on non-ok HTTP response without detail", async () => {
+  it("throws a typed FlowExecutionError on a 500 with a non-standard body", async () => {
     const fetch = vi.fn(async () => ({
       ok: false,
       status: 500,
@@ -338,6 +346,7 @@ describe("runAgentLoop", () => {
       json: async () => ({}),
     })) as unknown as typeof globalThis.fetch;
 
+    // A 5xx maps to the SDK's FlowExecutionError (a NoukaiError → instanceof Error).
     await expect(
       runAgentLoop("Hi", {
         endpoint: "/api/agent",
@@ -345,7 +354,49 @@ describe("runAgentLoop", () => {
         resolveToolCall: simpleResolver,
         fetch,
       }),
-    ).rejects.toThrow("API error: 500 Internal Server Error");
+    ).rejects.toBeInstanceOf(FlowExecutionError);
+  });
+
+  it("surfaces detail.message even when the error body omits `code` (A4)", async () => {
+    // The SDK's parseErrorDetail only lifts detail.message when BOTH `code` and
+    // `message` are strings. A {detail:{message}} body WITHOUT a code would
+    // otherwise regress to the SDK's generic (JSON-stringified body) fallback —
+    // runAgentLoop recovers the friendly message. The anchored regex would NOT
+    // match the stringified body `{"detail":{"message":"..."}}`, so it fails
+    // unless the friendly message is surfaced verbatim.
+    const fetch = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      json: async () => ({ detail: { message: "Please try again shortly." } }),
+    })) as unknown as typeof globalThis.fetch;
+
+    const call = runAgentLoop("Hi", {
+      endpoint: "/api/agent",
+      tools: TOOLS,
+      resolveToolCall: simpleResolver,
+      fetch,
+    });
+    await expect(call).rejects.toBeInstanceOf(FlowExecutionError);
+    await expect(call).rejects.toThrow(/^Please try again shortly\.$/);
+  });
+
+  it('throws (not returns a message) when the flow completes with status "failed" at HTTP 200', async () => {
+    // The server returns a failed execution as an HTTP 200 body with
+    // status:"failed" (SeqflowExecuteResponse). It must surface as an error,
+    // not be coerced into an (often empty) assistant message.
+    const fetch = mockFetch([
+      { status: "failed", result: { error: "block X failed" }, flowId: "f1", blockCount: 1 },
+    ]);
+
+    const call = runAgentLoop("Hi", {
+      endpoint: "/api/agent",
+      tools: TOOLS,
+      resolveToolCall: simpleResolver,
+      fetch,
+    });
+    await expect(call).rejects.toBeInstanceOf(FlowExecutionError);
+    await expect(call).rejects.toThrow(/failed/i);
   });
 
   it("supports async resolvers", async () => {
@@ -405,7 +456,7 @@ describe("runAgentLoop", () => {
     });
   });
 
-  it("does not send parameters on resume requests", async () => {
+  it("resume request carries the SDK's resume markers (executionId + tool results)", async () => {
     const fetch = mockFetch([
       {
         status: "tool_calls_required",
@@ -435,13 +486,18 @@ describe("runAgentLoop", () => {
       fetch,
     });
 
-    // Resume request should NOT have parameters
+    // The resume is now shaped by the SDK loop: it is identified by executionId
+    // + pausedAtStep + toolCallMessages (the server's resume markers). Unlike the
+    // old hand-rolled loop it may also echo the fresh call's parameters — the
+    // server ignores them on resume, so this is a benign wire delta.
     const resumeBody = JSON.parse(fetch.mock.calls[1][1].body);
-    expect(resumeBody.parameters).toBeUndefined();
     expect(resumeBody.executionId).toBe("exec-1");
+    expect(resumeBody.pausedAtStep).toBe("step-1");
+    expect(resumeBody.toolCallMessages).toHaveLength(1);
+    expect(resumeBody.toolCallMessages[0].toolCallId).toBe("tc-1");
   });
 
-  it("passes AbortSignal to fetch", async () => {
+  it("passes an AbortSignal to fetch that honors the caller's signal", async () => {
     const controller = new AbortController();
     const fetch = mockFetch([
       { status: "completed", result: "Hello", flowId: "f1", blockCount: 1 },
@@ -455,10 +511,20 @@ describe("runAgentLoop", () => {
       fetch,
     });
 
-    expect(fetch.mock.calls[0][1].signal).toBe(controller.signal);
+    // The SDK's relay transport combines the caller's signal with a default
+    // request timeout, so fetch receives a *combined* AbortSignal rather than
+    // the caller's identical object. The contract that matters is that the
+    // caller's signal is honored: aborting the caller aborts what fetch got.
+    const passed = fetch.mock.calls[0][1].signal;
+    expect(passed).toBeInstanceOf(AbortSignal);
+    expect(passed.aborted).toBe(false);
+    controller.abort();
+    expect(passed.aborted).toBe(true);
   });
 
-  it("defaults to 12 max iterations", async () => {
+  it("defaults to 10 tool-call rounds (reconciled from the old 12)", async () => {
+    // Each pause uses distinct args so the dedup cache never short-circuits the
+    // loop before the round limit.
     const responses = Array.from({ length: 12 }, (_, i) => ({
       status: "tool_calls_required",
       executionId: "exec-1",
@@ -486,7 +552,8 @@ describe("runAgentLoop", () => {
     });
 
     expect(result).toEqual({ type: "max_iterations" });
-    expect(fetch).toHaveBeenCalledTimes(12);
+    // Default is now the SDK's 10 resume rounds → 1 fresh call + 10 resumes.
+    expect(fetch).toHaveBeenCalledTimes(11);
   });
 
   it("deduplicates repeated tool calls with identical args", async () => {

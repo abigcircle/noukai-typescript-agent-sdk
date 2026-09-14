@@ -2,9 +2,12 @@ import { describe, it, expect } from "vitest";
 import {
   toWireToolDef,
   toWireToolDefs,
+  toWireToolCall,
   parseWireToolCall,
   toWireToolResult,
+  toChatMessages,
 } from "../src/wire-adapters";
+import type { AgentTurn } from "../src/types";
 
 describe("toWireToolDef", () => {
   it("wraps a ToolDefinition in the wire envelope", () => {
@@ -104,13 +107,60 @@ describe("parseWireToolCall", () => {
 });
 
 describe("toWireToolResult", () => {
-  it("produces wire-format tool result with snake_case tool_call_id", () => {
+  it("produces wire-format tool result with camelCase toolCallId", () => {
     const result = toWireToolResult("call_123", '{"temp":14}');
 
     expect(result).toEqual({
       role: "tool",
-      tool_call_id: "call_123",
+      toolCallId: "call_123",
       content: '{"temp":14}',
+    });
+  });
+});
+
+describe("toChatMessages", () => {
+  it("maps text turns straight through (camelCase, no cast)", () => {
+    const turns: AgentTurn[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ];
+    expect(toChatMessages(turns)).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ]);
+  });
+
+  it("serializes an assistant tool-call turn to the wire envelope (object args → JSON string)", () => {
+    const turns: AgentTurn[] = [
+      {
+        role: "assistant",
+        content: null,
+        toolCalls: [{ id: "tc-1", name: "get_data", arguments: { k: "v" } }],
+      },
+    ];
+    expect(toChatMessages(turns)).toEqual([
+      {
+        role: "assistant",
+        content: null,
+        toolCalls: [
+          { id: "tc-1", type: "function", function: { name: "get_data", arguments: '{"k":"v"}' } },
+        ],
+      },
+    ]);
+  });
+
+  it("maps a tool result turn with camelCase toolCallId", () => {
+    const turns: AgentTurn[] = [{ role: "tool", toolCallId: "tc-1", content: "ok" }];
+    expect(toChatMessages(turns)).toEqual([{ role: "tool", toolCallId: "tc-1", content: "ok" }]);
+  });
+});
+
+describe("toWireToolCall", () => {
+  it("serializes an internal ToolCall to the nested function envelope", () => {
+    expect(toWireToolCall({ id: "c1", name: "lookup", arguments: { q: "x" } })).toEqual({
+      id: "c1",
+      type: "function",
+      function: { name: "lookup", arguments: '{"q":"x"}' },
     });
   });
 });

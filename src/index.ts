@@ -69,8 +69,10 @@ export type {
 export {
   toWireToolDef,
   toWireToolDefs,
+  toWireToolCall,
   parseWireToolCall,
   toWireToolResult,
+  toChatMessages,
 } from "./wire-adapters.js";
 export type {
   WireToolDef,
@@ -79,6 +81,7 @@ export type {
 } from "./wire-adapters.js";
 
 // ─── Session Store (optional chat persistence) ────────────────
+export { MemorySessionStore } from "./session-store.js";
 export type {
   ChatSession,
   ChatSessionStore,
