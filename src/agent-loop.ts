@@ -25,6 +25,7 @@ import {
   FlowExecutionError,
   NoukaiError,
 } from "@noukai/sdk";
+import { makeAgentSpanFactory } from "./otel.js";
 import type { AgentTurn, ToolCall, ToolDefinition, ToolResolver, ToolResult } from "./types.js";
 import {
   toWireToolDefs,
@@ -62,6 +63,27 @@ export interface AgentLoopOptions<M = Record<string, unknown>> {
    * are ignored. Absent = the default (Nana) path, unchanged.
    */
   messages?: AgentTurn[];
+  /**
+   * Opt in to OpenTelemetry tracing for this loop. Default `false` is a true
+   * no-op (never imports `@opentelemetry/api`). When on, the loop emits one
+   * `invoke_agent` span with `noukai.agent.round` (per relay round-trip) and
+   * `execute_tool {name}` (per local tool resolution) children into your OTel
+   * provider, and injects a W3C `traceparent` on each POST so an instrumented
+   * relay continues the same trace.
+   */
+  otel?: boolean;
+  /** An explicit OTel `Tracer` to use instead of the global provider's. Typed
+   *  `unknown` so this package never hard-imports `@opentelemetry/api`. */
+  tracer?: unknown;
+  /** Attach bounded (4096-char) tool arguments/result to tool spans. Opt-in —
+   *  may contain PII. Mirrors the base SDK's `otelStepPayloads`. */
+  toolPayloads?: boolean;
+  /** An OTel `Context` to parent the turn span under — e.g. a UI click-handler
+   *  span captured at send time for a detached background turn. Typed `unknown`. */
+  otelContext?: unknown;
+  /** Session id recorded on the turn span (`session.id`) for background/multi-tab
+   *  turns. Purely for trace labeling; does not affect the loop. */
+  sessionId?: string;
 }
 
 export type AgentLoopResult<M = Record<string, unknown>> =
@@ -88,6 +110,11 @@ export async function runAgentLoop<M = Record<string, unknown>>(
     parameters,
     toolChoice,
     messages,
+    otel,
+    tracer,
+    toolPayloads,
+    otelContext,
+    sessionId,
   } = options;
 
   // WireToolDef carries an index signature, so it is structurally a
@@ -98,91 +125,122 @@ export async function runAgentLoop<M = Record<string, unknown>>(
   // Key: "toolName:serializedArgs" → cached result string (persists across rounds).
   const resolvedCache = new Map<string, string>();
 
-  const toolHandler = async (
-    rawCalls: Record<string, unknown>[],
-  ): Promise<Record<string, unknown>[]> => {
-    const allCalls = rawCalls.map((c) => parseWireToolCall(c as unknown as WireToolCall));
-
-    const cached: { call: ToolCall; result: string }[] = [];
-    const fresh: ToolCall[] = [];
-    for (const call of allCalls) {
-      const key = `${call.name}:${JSON.stringify(call.arguments)}`;
-      const hit = resolvedCache.get(key);
-      if (hit !== undefined) cached.push({ call, result: hit });
-      else fresh.push(call);
-    }
-
-    const results: Record<string, unknown>[] = [];
-    // Cached results first (matches the previous loop's ordering).
-    for (const { call, result } of cached) {
-      results.push(toWireToolResult(call.id, result));
-    }
-    // Resolve fresh calls one at a time, notifying before each so thinking
-    // labels appear sequentially.
-    for (const call of fresh) {
-      onToolCallStart?.([call]);
-      const result: ToolResult = await Promise.resolve(resolveToolCall(call));
-      const key = `${call.name}:${JSON.stringify(call.arguments)}`;
-      resolvedCache.set(key, result.result);
-      results.push(toWireToolResult(call.id, result.result));
-    }
-    return results;
-  };
-
-  const flow = createRelayFlow({
-    url: endpoint,
-    ...(fetchFn !== undefined ? { fetch: fetchFn } : {}),
+  // Opt-in OTel. `otel` falsy → a no-op factory that never imports OpenTelemetry
+  // and leaves the loop byte-for-byte unchanged (wrapFetch returns fetchFn as-is,
+  // toolSpan just runs its fn).
+  const spans = makeAgentSpanFactory(otel ?? false, tracer, {
+    toolPayloads: toolPayloads ?? false,
   });
 
-  // Fresh call. Chat-flow mode sends structured `messages`; the default (Nana)
-  // path sends `message` + `parameters`. Resume shape is owned by the SDK loop.
-  const common = {
-    tools: wireTools,
-    ...(toolChoice != null ? { toolChoice } : {}),
-    toolHandler,
-    maxToolRounds: maxIterations,
-    ...(signal !== undefined ? { signal } : {}),
-  };
+  return spans.turnSpan(
+    {
+      tools: tools.map((t) => t.name),
+      mode: messages != null ? "messages" : "message",
+      maxRounds: maxIterations,
+      ...(sessionId !== undefined ? { sessionId } : {}),
+    },
+    async (turn): Promise<AgentLoopResult<M>> => {
+      const toolHandler = async (
+        rawCalls: Record<string, unknown>[],
+      ): Promise<Record<string, unknown>[]> => {
+        const allCalls = rawCalls.map((c) => parseWireToolCall(c as unknown as WireToolCall));
 
-  try {
-    const result =
-      messages != null
-        ? await flow.execute({ messages: toChatMessages(messages), ...common })
-        : await flow.execute({
-            message,
-            ...(parameters != null ? { parameters } : {}),
-            ...common,
+        const cached: { call: ToolCall; result: string }[] = [];
+        const fresh: ToolCall[] = [];
+        for (const call of allCalls) {
+          const key = `${call.name}:${JSON.stringify(call.arguments)}`;
+          const hit = resolvedCache.get(key);
+          if (hit !== undefined) cached.push({ call, result: hit });
+          else fresh.push(call);
+        }
+
+        const results: Record<string, unknown>[] = [];
+        // Cached results first (matches the previous loop's ordering).
+        for (const { call, result } of cached) {
+          turn.recordCachedTool(call);
+          results.push(toWireToolResult(call.id, result));
+        }
+        // Resolve fresh calls one at a time, notifying before each so thinking
+        // labels appear sequentially. Each resolution runs inside a tool span —
+        // the only place the client-side execution latency/outcome is observable.
+        for (const call of fresh) {
+          onToolCallStart?.([call]);
+          const resultStr = await turn.toolSpan(call, async () => {
+            const result: ToolResult = await Promise.resolve(resolveToolCall(call));
+            return result.result;
           });
+          const key = `${call.name}:${JSON.stringify(call.arguments)}`;
+          resolvedCache.set(key, resultStr);
+          results.push(toWireToolResult(call.id, resultStr));
+        }
+        return results;
+      };
 
-    // Defensive guard for the no-handler case: with a `toolHandler` passed (as
-    // we always do here) the SDK loop auto-resumes to a terminal result or
-    // throws ToolCallLimitError, so a residual pause is unreachable. Kept — not
-    // removed — to preserve the type-narrowing on `result` for the code below.
-    if (result.requiresToolCalls) {
-      return { type: "max_iterations" };
-    }
-    // A flow that completes with status:"failed" (HTTP 200) is an execution
-    // failure, not a message. The pre-rewire loop threw on any status that was
-    // neither "completed" nor "tool_calls_required"; preserve that contract so
-    // a failed run is not silently surfaced as an (often empty) assistant
-    // message. (design 20260903-SDK-agent-relay, PR-3 — regression fix.)
-    if (result.status === "failed") {
-      const detail = result.result !== undefined ? `: ${JSON.stringify(result.result)}` : "";
-      throw new FlowExecutionError(`Flow execution failed${detail}`, {
-        statusCode: 200,
-        responseBody: result.result,
-        code: "FLOW_EXECUTION_FAILED",
+      // Wrap the loop's fetch so each relay round-trip is a CLIENT span carrying
+      // an injected `traceparent`. The no-op turn returns `fetchFn` unchanged, so
+      // the off path omits `fetch` exactly as before.
+      const tracedFetch = turn.wrapFetch(fetchFn);
+      const flow = createRelayFlow({
+        url: endpoint,
+        ...(tracedFetch !== undefined ? { fetch: tracedFetch } : {}),
       });
-    }
-    return extractResult<M>(result.result);
-  } catch (err) {
-    // The SDK throws ToolCallLimitError at the client round limit; the public
-    // contract here is the `max_iterations` sentinel, not a throw.
-    if (err instanceof ToolCallLimitError) {
-      return { type: "max_iterations" };
-    }
-    throw withFriendlyMessage(err);
-  }
+
+      // Fresh call. Chat-flow mode sends structured `messages`; the default (Nana)
+      // path sends `message` + `parameters`. Resume shape is owned by the SDK loop.
+      const common = {
+        tools: wireTools,
+        ...(toolChoice != null ? { toolChoice } : {}),
+        toolHandler,
+        maxToolRounds: maxIterations,
+        ...(signal !== undefined ? { signal } : {}),
+      };
+
+      try {
+        const result =
+          messages != null
+            ? await flow.execute({ messages: toChatMessages(messages), ...common })
+            : await flow.execute({
+                message,
+                ...(parameters != null ? { parameters } : {}),
+                ...common,
+              });
+
+        // Defensive guard for the no-handler case: with a `toolHandler` passed (as
+        // we always do here) the SDK loop auto-resumes to a terminal result or
+        // throws ToolCallLimitError, so a residual pause is unreachable. Kept — not
+        // removed — to preserve the type-narrowing on `result` for the code below.
+        if (result.requiresToolCalls) {
+          turn.setTermination("max_iterations");
+          return { type: "max_iterations" };
+        }
+        // A flow that completes with status:"failed" (HTTP 200) is an execution
+        // failure, not a message. The pre-rewire loop threw on any status that was
+        // neither "completed" nor "tool_calls_required"; preserve that contract so
+        // a failed run is not silently surfaced as an (often empty) assistant
+        // message. (design 20260903-SDK-agent-relay, PR-3 — regression fix.) The
+        // throw propagates to turnSpan's own catch, which marks termination=error.
+        if (result.status === "failed") {
+          const detail = result.result !== undefined ? `: ${JSON.stringify(result.result)}` : "";
+          throw new FlowExecutionError(`Flow execution failed${detail}`, {
+            statusCode: 200,
+            responseBody: result.result,
+            code: "FLOW_EXECUTION_FAILED",
+          });
+        }
+        turn.setTermination("completed");
+        return extractResult<M>(result.result);
+      } catch (err) {
+        // The SDK throws ToolCallLimitError at the client round limit; the public
+        // contract here is the `max_iterations` sentinel, not a throw.
+        if (err instanceof ToolCallLimitError) {
+          turn.setTermination("max_iterations");
+          return { type: "max_iterations" };
+        }
+        throw withFriendlyMessage(err);
+      }
+    },
+    otelContext,
+  );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────

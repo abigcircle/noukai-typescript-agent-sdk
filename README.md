@@ -23,6 +23,7 @@ Your component
 - [Tool registry](#tool-registry)
 - [Tool label formatter](#tool-label-formatter)
 - [Endpoint contract](#endpoint-contract)
+- [OpenTelemetry (opt-in)](#opentelemetry-opt-in)
 - [Scripts](#scripts)
 
 ## Install
@@ -268,6 +269,60 @@ polluting the message content.
 > implementation checklist live in the SDK relay guide:
 > [`@noukai/sdk` docs/AGENT_RELAY.md](../noukai-typescript-sdk/docs/AGENT_RELAY.md)
 > (Python: [`noukai-sdk` docs/AGENT_RELAY.md](../noukai-python-sdk/docs/AGENT_RELAY.md)).
+
+## OpenTelemetry (opt-in)
+
+The loop can emit [OpenTelemetry](https://opentelemetry.io/) spans into **your
+own** OTel provider. This is the only place the browser-side loop is
+observable — a server-side trace never sees your local `resolveToolCall`
+executions (how long they ran, whether they threw, dedup-cache hits). It is
+**off by default** and a true no-op when off (the package never imports
+OpenTelemetry unless you opt in).
+
+`@opentelemetry/api` is an optional peer dependency — install it and turn it on
+with `otel: true`:
+
+```bash
+npm install @opentelemetry/api
+```
+
+```ts
+import { runAgentLoop } from "@noukai/agent";
+
+const result = await runAgentLoop("Hi", {
+  endpoint: "/api/ai/chat",
+  tools: registry.definitions(),
+  resolveToolCall: (call) => registry.resolve(call),
+  otel: true,            // emit spans into the globally-configured provider
+  // tracer,             // …or pass an explicit OTel Tracer
+  // toolPayloads: true, // attach bounded tool args/result (may contain PII)
+});
+```
+
+`useAgentChat({ …, otel: true })` works the same way; when a `sessionId` is set
+it is recorded on the turn span as `session.id`.
+
+**Span tree.** One `invoke_agent` span per loop, with two kinds of child:
+
+| Span | Kind | Key attributes |
+|------|------|----------------|
+| `invoke_agent` | INTERNAL | `noukai.agent.tools` (the tool list), `noukai.agent.request_mode`, `noukai.agent.max_rounds`, `noukai.agent.rounds`, `noukai.agent.termination` (`completed` \| `max_iterations` \| `error`) |
+| `noukai.agent.round` | CLIENT | `http.response.status_code`, `noukai.agent.round_index` — one per relay round-trip |
+| `execute_tool {name}` | INTERNAL | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `noukai.tool.cache_hit` (+ `noukai.tool.arguments`/`noukai.tool.result` when `toolPayloads`) |
+
+**Unified trace (browser → relay → Noukai).** Each relay POST is wrapped to
+inject a W3C `traceparent` from the round span, so an OTel-instrumented relay
+continues the **same** trace. Note this uses your app's globally-configured
+propagator — the standard `provider.register()` sets W3C by default. To extend
+the trace through the relay to the Noukai ingress, pair this with the base SDK's
+relay `traceparent` forwarding (`@noukai/sdk` ≥ the OTel release). The trace ends
+at Noukai's ingress — the flow's server-side execution has no OTel today.
+
+**Background turns.** For a detached turn (`backgroundTurns: true`), pass
+`otelContext` (an OTel `Context`) if you want the turn span parented under a
+specific UI span — it is snapshotted at send, since a detached turn runs with no
+ambient context. Without it, the turn span roots at the active context when the
+send fires.
 
 ## Scripts
 

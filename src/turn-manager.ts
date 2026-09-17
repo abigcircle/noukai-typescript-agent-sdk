@@ -87,6 +87,15 @@ export interface ExecutionSnapshot {
   onToolCallStart?: (toolCalls: ToolCall[], ctx: { sessionId: string }) => void;
   onMetadata?: (metadata: unknown, ctx: { sessionId: string }) => void;
   onTurnError?: (error: Error, ctx: { sessionId: string }) => void;
+  /** OTel opt-in, snapshotted at send so a detached turn keeps the same tracing
+   *  config (and parent context) it was started with, regardless of later
+   *  option/tab changes. All no-ops when `otel` is falsy. */
+  otel?: boolean;
+  tracer?: unknown;
+  toolPayloads?: boolean;
+  /** Parent OTel `Context` captured at send — threaded explicitly because a
+   *  background turn runs detached (no ambient context survives `void runTurn`). */
+  otelContext?: unknown;
   /** Test seam. Defaults to {@link runAgentLoop}. */
   loopRunner?: LoopRunner;
 }
@@ -294,6 +303,13 @@ async function runTurn(
         ? { maxIterations: snapshot.maxIterations }
         : {}),
       signal: state.controller.signal,
+      // OTel: config snapshotted at send; `sessionId` labels the turn span, and
+      // `otelContext` re-parents it (this detached turn has no ambient context).
+      ...(snapshot.otel !== undefined ? { otel: snapshot.otel } : {}),
+      ...(snapshot.tracer !== undefined ? { tracer: snapshot.tracer } : {}),
+      ...(snapshot.toolPayloads !== undefined ? { toolPayloads: snapshot.toolPayloads } : {}),
+      ...(snapshot.otelContext !== undefined ? { otelContext: snapshot.otelContext } : {}),
+      sessionId: state.sessionId,
       ...modeArgs,
       onToolCallStart: (toolCalls) => {
         const labels = snapshot.formatter.format(

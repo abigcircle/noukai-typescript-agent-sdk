@@ -10,6 +10,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-17
+
+### Added
+
+- **Opt-in OpenTelemetry for the agent loop (design `20260917-SDK-agent-otel`).**
+  `runAgentLoop` / `useAgentChat` accept `otel: true` to emit client-side spans
+  into your own OTel provider — the only place the browser-side loop and its
+  **local tool executions** are observable (a server-side trace never sees how
+  long `resolveToolCall` ran or whether it threw). Off by default and a **true
+  no-op** when off (never imports `@opentelemetry/api`).
+  - **Span tree.** One `invoke_agent` span (kind INTERNAL) per loop, carrying
+    `noukai.agent.tools` (the tool list), `noukai.agent.request_mode`,
+    `noukai.agent.max_rounds`, and — at the end — `noukai.agent.rounds` and
+    `noukai.agent.termination` (`completed` | `max_iterations` | `error`). Two
+    kinds of child: `noukai.agent.round` (kind CLIENT) per relay round-trip with
+    `http.response.status_code`, and `execute_tool {name}` (kind INTERNAL) per
+    local resolution with `gen_ai.tool.name` / `gen_ai.tool.call.id` and a
+    `noukai.tool.cache_hit` flag for dedup-cache serves.
+  - **Unified trace (browser↔relay).** Each relay POST is wrapped so a W3C
+    `traceparent` is injected from the round span — an OTel-instrumented relay
+    continues the SAME trace. Pair with the base SDK's relay `traceparent`
+    forwarding to reach the Noukai ingress.
+  - **`tracer?`** — pass an explicit OTel `Tracer` instead of the global
+    provider's. **`otelContext?`** — an OTel `Context` to parent the turn span
+    under (snapshotted at send for detached background turns, which run with no
+    ambient context). **`toolPayloads?`** — opt in to bounded (4096-char)
+    `noukai.tool.arguments` / `noukai.tool.result` attributes (may contain PII;
+    off by default). **`sessionId`** is recorded as `session.id` on the span.
+  - `@opentelemetry/api` is a new **optional** peer dependency — install it only
+    if you turn `otel` on.
+
 ## [0.3.0] — 2026-09-14
 
 ### Added

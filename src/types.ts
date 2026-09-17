@@ -179,6 +179,24 @@ export interface AgentChatOptions<M = Record<string, unknown>> {
    * persist and a stable identity to run under.
    */
   backgroundTurns?: boolean;
+  /**
+   * Opt in to OpenTelemetry tracing for each turn. Default `false` is a true
+   * no-op (never imports `@opentelemetry/api`). When on, each `sendMessage`
+   * emits one `invoke_agent` span (with `noukai.agent.round` + `execute_tool`
+   * children) into your OTel provider and injects a W3C `traceparent` on each
+   * relay POST — so an instrumented relay continues the same trace. When
+   * `sessionId` is set it is recorded on the turn span as `session.id`.
+   */
+  otel?: boolean;
+  /** An explicit OTel `Tracer` to use instead of the global provider's. Typed
+   *  `unknown` so this package never hard-imports `@opentelemetry/api`. */
+  tracer?: unknown;
+  /** Attach bounded tool arguments/result to tool spans (opt-in; may contain PII). */
+  toolPayloads?: boolean;
+  /** An OTel `Context` to parent every turn span under (e.g. a page-load span).
+   *  Captured once here; for a detached background turn it is snapshotted at
+   *  send so the turn nests correctly even after the hook unmounts. */
+  otelContext?: unknown;
 }
 
 /** Return value from the useAgentChat hook */

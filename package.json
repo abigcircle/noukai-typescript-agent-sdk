@@ -1,6 +1,6 @@
 {
   "name": "@noukai/agent",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Generic client-side agent framework for Noukai flows — a domain-agnostic yield/resume tool-calling loop (with an optional React hook) for browser and relay agents.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -55,15 +55,21 @@
     "@noukai/sdk": "^0.4.0"
   },
   "peerDependencies": {
-    "react": "^18.0.0"
+    "react": "^18.0.0",
+    "@opentelemetry/api": "^1.0.0"
   },
   "peerDependenciesMeta": {
     "react": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
       "optional": true
     }
   },
   "devDependencies": {
     "@eslint/js": "^9",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-base": "^2.0.0",
     "@types/express": "^5.0.6",
     "@types/react": "^18.2.20",
     "@typescript-eslint/eslint-plugin": "^8",

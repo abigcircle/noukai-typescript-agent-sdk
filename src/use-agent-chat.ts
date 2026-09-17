@@ -128,6 +128,12 @@ export function useAgentChat<M = Record<string, unknown>>(
             ? { onMetadata: o.onMetadata as ExecutionSnapshot["onMetadata"] }
             : {}),
           ...(o.onTurnError !== undefined ? { onTurnError: o.onTurnError } : {}),
+          // OTel: snapshot the config at send so a detached turn keeps it even
+          // if options change before it finishes. All no-ops when `otel` is off.
+          ...(o.otel !== undefined ? { otel: o.otel } : {}),
+          ...(o.tracer !== undefined ? { tracer: o.tracer } : {}),
+          ...(o.toolPayloads !== undefined ? { toolPayloads: o.toolPayloads } : {}),
+          ...(o.otelContext !== undefined ? { otelContext: o.otelContext } : {}),
         };
         startTurn(o.store, o.sessionId, snapshot, content);
         return;
@@ -163,6 +169,11 @@ export function useAgentChat<M = Record<string, unknown>>(
           toolLabelFormatter,
           toolCallContext,
           sendStructuredMessages,
+          otel,
+          tracer,
+          toolPayloads,
+          otelContext,
+          sessionId: sid,
         } = optionsRef.current;
         const formatter = toolLabelFormatter ?? defaultFormatter;
 
@@ -183,6 +194,12 @@ export function useAgentChat<M = Record<string, unknown>>(
           resolveToolCall,
           maxIterations,
           signal: controller.signal,
+          // OTel opt-in (all no-ops when `otel` is falsy — never imports OTel).
+          ...(otel !== undefined ? { otel } : {}),
+          ...(tracer !== undefined ? { tracer } : {}),
+          ...(toolPayloads !== undefined ? { toolPayloads } : {}),
+          ...(otelContext !== undefined ? { otelContext } : {}),
+          ...(sid !== undefined ? { sessionId: sid } : {}),
           ...modeArgs,
           onToolCallStart: (toolCalls) => {
             const labels = formatter.format(toolCalls, toolCallContext);
