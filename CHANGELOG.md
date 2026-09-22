@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-09-21
+
+### Changed
+
+- Widen `react` peer dependency to `^18.0.0 || ^19.0.0` so React 19 consumers no
+  longer pull a duplicate react@18 (fixes "Invalid hook call" dual-React under
+  pnpm autoInstallPeers). No runtime changes.
+
 ## [0.3.1] — 2026-09-17
 
 ### Added
